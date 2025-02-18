@@ -1,0 +1,10 @@
+ht~dap
+ht~I(1/dap)
+ht~I(1/dap^2)
+ht~I(dap^2)
+ht~dap+I(dap^2)
+ht~log(dap)
+ht~I(1/log(dap))
+ht~I(1)+I(1/dap)
+ht~I(dap/(1+dap))
+ht~I(log(dap)^2) 
