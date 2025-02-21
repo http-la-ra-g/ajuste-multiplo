@@ -118,15 +118,14 @@ ui <- fluidPage(
                         div(class = "well",
                             h3("Formato dos Arquivos"),
                             h4("Arquivo Excel:"),
-                            p("Deve conter as colunas:"),
-                            tags$ul(
-                              tags$li("parcela"),
-                              tags$li("dap"),
-                              tags$li("ht")
+                            p("O arquivo deve conter exatamente 4 colunas nesta ordem:"),
+                            tags$ol(
+                              tags$li("parcela: identificador da parcela"),
+                              tags$li("dap: Diâmetro à Altura do Peito (cm)"),
+                              tags$li("ht: Altura total medida (m)"),
+                              tags$li("ht_estimada: Coloque 0 para árvores que precisam de estimativa")
                             ),
-                            h4("Arquivo de Modelos:"),
-                            p("Deve conter um modelo por linha, exemplo:"),
-                            tags$pre("ht~dap\nht~I(1/dap^2)\nht~I(dap^2)\nht~dap+I(dap^2)")
+                            p("Importante: Não inclua cabeçalho no arquivo Excel")
                         )
                     )
             ),
@@ -144,7 +143,14 @@ ui <- fluidPage(
             # Aba Resultados
             tabPanel(tags$span(icon("table"), "Resultados"),
                     div(style = "padding: 20px;",
-                        DTOutput("tabela_resultados")
+                        div(class = "well",
+                            h4("Estatísticas do Ajuste"),
+                            verbatimTextOutput("estatisticas_ajuste")
+                        ),
+                        div(class = "well",
+                            h4("Resultados Detalhados"),
+                            DTOutput("tabela_resultados")
+                        )
                     )
             )
           )
@@ -180,24 +186,85 @@ server <- function(input, output, session) {
   dados_processados <- eventReactive(input$processar, {
     req(input$arquivo, modelos())
     
-    dados_parcela <- read.xlsx(input$arquivo$datapath)
+    # Leitura dos dados
+    dados_parcela <- tryCatch({
+      read.xlsx(input$arquivo$datapath)
+    }, error = function(e) {
+      stop("Erro ao ler o arquivo Excel. Verifique o formato do arquivo.")
+    })
+    
+    # Verificar número de colunas
+    if(ncol(dados_parcela) != 4) {
+      stop("O arquivo deve ter exatamente 4 colunas: parcela, dap, ht e ht_estimada")
+    }
+    
+    # Renomear as colunas
+    names(dados_parcela) <- c("parcela", "dap", "ht", "ht_estimada")
+    
+    # Verificar tipos de dados
+    if(!is.numeric(dados_parcela$dap) || !is.numeric(dados_parcela$ht)) {
+      stop("As colunas DAP e HT devem conter valores numéricos")
+    }
+    
     parcelas <- unique(dados_parcela$parcela)
     
+    # Inicialização dos vetores
     syx <- c()
     ajuste <- c()
     result <- c()
     
-    for(i in 1:NROW(parcelas)){
-      dados_ajuste <- subset(dados_parcela, dados_parcela[1]==parcelas[i]&dados_parcela[4]!=0)
-      dados_sem_zero <- subset(dados_parcela, dados_parcela[,1]==parcelas[i] & dados_parcela[,4]==0,)
-      for(j in 1:length(modelos())){
-        ajuste <- lm(modelos()[[j]], dados_ajuste)
-        syx[j] <- summary(ajuste)[[6]]
+    # Adicionar coluna para armazenar qual modelo foi selecionado
+    modelo_selecionado <- c()
+    
+    withProgress(message = 'Processando dados', value = 0, {
+      for(i in 1:NROW(parcelas)){
+        # Atualizar barra de progresso
+        incProgress(1/NROW(parcelas))
+        
+        # Separar dados com e sem altura
+        dados_ajuste <- subset(dados_parcela, parcela == parcelas[i] & ht_estimada != 0)
+        dados_sem_zero <- subset(dados_parcela, parcela == parcelas[i] & ht_estimada == 0)
+        
+        # Criar ambiente com as variáveis necessárias
+        dados_ajuste_env <- with(dados_ajuste, data.frame(
+          ht = ht,
+          dap = dap
+        ))
+        
+        dados_sem_zero_env <- with(dados_sem_zero, data.frame(
+          dap = dap
+        ))
+        
+        # Testar todos os modelos
+        syx <- numeric(length(modelos()))
+        for(j in 1:length(modelos())){
+          tryCatch({
+            ajuste <- lm(modelos()[[j]], data = dados_ajuste_env)
+            syx[j] <- summary(ajuste)[[6]]
+          }, error = function(e) {
+            syx[j] <- Inf
+            warning(paste("Erro no ajuste do modelo", j, ":", e$message))
+          })
+        }
+        
+        # Selecionar e aplicar o melhor modelo
+        melhor_indice <- which.min(syx)
+        modelo_melhor <- lm(modelos()[[melhor_indice]], data = dados_ajuste_env)
+        
+        # Predizer alturas
+        if(nrow(dados_sem_zero) > 0) {
+          dados_sem_zero$ht_estimada <- predict(modelo_melhor, newdata = dados_sem_zero_env)
+        }
+        
+        # Adicionar informação do modelo selecionado
+        dados_ajuste$modelo_selecionado <- deparse(modelos()[[melhor_indice]])
+        dados_sem_zero$modelo_selecionado <- deparse(modelos()[[melhor_indice]])
+        
+        # Combinar resultados
+        result <- rbind(result, rbind(dados_ajuste, dados_sem_zero))
       }
-      modelo_melhor <- lm(modelos()[[which.min(syx)]], dados_ajuste)
-      dados_sem_zero[,4] <- predict(modelo_melhor, dados_sem_zero)
-      result <- rbind(result, rbind(dados_ajuste, dados_sem_zero))
-    }
+    })
+    
     return(result)
   })
   
@@ -209,7 +276,21 @@ server <- function(input, output, session) {
                scrollX = TRUE,
                dom = 'Bfrtip',
                buttons = c('copy', 'csv', 'excel')
-             ))
+             ),
+             caption = "Resultados do Ajuste de Altura") %>%
+      formatRound(columns = c(2,3,4), digits = 2)  # Formatar colunas numéricas
+  })
+  
+  # Adicionar output para estatísticas do ajuste
+  output$estatisticas_ajuste <- renderPrint({
+    req(dados_processados())
+    dados <- dados_processados()
+    
+    cat("Resumo do Ajuste:\n")
+    cat("Número total de árvores:", nrow(dados), "\n")
+    cat("Número de parcelas:", length(unique(dados$parcela)), "\n")
+    cat("\nModelos selecionados por parcela:\n")
+    table(dados$modelo_selecionado)
   })
 }
 
