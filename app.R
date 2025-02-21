@@ -5,7 +5,7 @@ if (!require("shinyWidgets")) install.packages("shinyWidgets")
 if (!require("fontawesome")) install.packages("fontawesome")
 if (!require("DT")) install.packages("DT")
 if (!require("openxlsx")) install.packages("openxlsx")
-if (!require("dplyr")) install.packages("dplyr")
+if (!require("htmlwidgets")) install.packages("htmlwidgets")
 
 # Carregamento dos pacotes
 library(shiny)
@@ -14,7 +14,7 @@ library(shinyWidgets)
 library(fontawesome)
 library(DT)
 library(openxlsx)
-library(dplyr)
+library(htmlwidgets)
 
 # Interface do usuário (UI)
 ui <- fluidPage(
@@ -78,9 +78,6 @@ ui <- fluidPage(
                    tags$span(icon("file-upload"), "Selecione o arquivo Excel (.xlsx)"),
                    accept = c(".xlsx")),
           
-          # Campos para seleção das colunas
-          uiOutput("coluna_selector"),
-          
           fileInput("modelos_file", 
                    tags$span(icon("file-upload"), "Selecione o arquivo de modelos (.txt)"),
                    accept = c(".txt")),
@@ -123,13 +120,14 @@ ui <- fluidPage(
                         div(class = "well",
                             h3("Formato dos Arquivos"),
                             h4("Arquivo Excel:"),
-                            p("O arquivo deve conter as seguintes colunas:"),
+                            p("O arquivo deve conter exatamente 4 colunas nesta ordem:"),
                             tags$ol(
                               tags$li("parcela: identificador da parcela"),
-                              tags$li("arvore: número da árvore"),
                               tags$li("dap: Diâmetro à Altura do Peito (cm)"),
-                              tags$li("ht: Altura total (m) - use 0 para árvores que precisam de estimativa")
-                            )
+                              tags$li("ht: Altura total medida (m)"),
+                              tags$li("ht_estimada: Coloque 0 para árvores que precisam de estimativa")
+                            ),
+                            p("Importante: Não inclua cabeçalho no arquivo Excel")
                         )
                     )
             ),
@@ -148,12 +146,13 @@ ui <- fluidPage(
             tabPanel(tags$span(icon("table"), "Resultados"),
                     div(style = "padding: 20px;",
                         div(class = "well",
-                            h4("Diagnóstico do Processamento"),
-                            verbatimTextOutput("diagnostico"),
                             h4("Estatísticas do Ajuste"),
                             verbatimTextOutput("estatisticas_ajuste")
                         ),
                         div(class = "well",
+                            downloadButton("download_resultados", "Baixar Resultados em Excel",
+                                         class = "btn-primary",
+                                         style = "margin-bottom: 15px;"),
                             h4("Resultados Detalhados"),
                             DTOutput("tabela_resultados")
                         )
@@ -172,52 +171,12 @@ ui <- fluidPage(
 # Servidor
 server <- function(input, output, session) {
   
-  # Leitura dos dados
-  dados_input <- reactive({
-    req(input$arquivo)
-    dados <- read.xlsx(input$arquivo$datapath)
-    return(dados)
-  })
-  
   # Leitura dos modelos do arquivo txt
   modelos <- reactive({
     req(input$modelos_file)
-    # Lê os modelos como vetor de texto
-    modelos_txt <- readLines(input$modelos_file$datapath, warn = FALSE)
-    # Remove espaços em branco e linhas vazias
-    modelos_txt <- trimws(modelos_txt[nzchar(modelos_txt)])
-    return(modelos_txt)
-  })
-  
-  dados_processados <- eventReactive(input$processar, {
-    req(input$arquivo, modelos())
-    
-    # Leitura dos dados
-    dados_parcela <- read.xlsx(input$arquivo$datapath)
-    
-    # Renomear colunas para corresponder aos modelos
-    names(dados_parcela) <- c("parcela", "arvore", "dap", "ht")
-    
-    parcelas<-unique(dados_parcela[,1])
-    syx<-c()
-    ajuste<-c()
-    result<-c()
-    
-    for(i in 1:NROW(parcelas)){
-      dados_ajuste<-subset(dados_parcela, dados_parcela[,1]==parcelas[i]&dados_parcela[,4]!=0)
-      dados_sem_zero<-subset(dados_parcela, dados_parcela[,1]==parcelas[i]&dados_parcela[,4]==0)
-      for(j in 1:NROW(modelos())){
-        # Converte o texto do modelo em fórmula apenas quando necessário
-        modelo_formula <- as.formula(modelos()[j])
-        ajuste<-lm(modelo_formula, dados_ajuste)
-        syx[j]<-summary(ajuste)[[6]]
-      }
-      modelo_melhor<-lm(as.formula(modelos()[which.min(syx)]), dados_ajuste)
-      dados_sem_zero[,4]<-predict(modelo_melhor,dados_sem_zero)
-      result<-rbind(result,rbind(dados_ajuste,dados_sem_zero))
-    }
-    
-    return(result)
+    modelos_txt <- readLines(input$modelos_file$datapath)
+    modelos_list <- lapply(modelos_txt, function(x) as.formula(x))
+    return(modelos_list)
   })
   
   # Preview dos modelos carregados
@@ -225,25 +184,107 @@ server <- function(input, output, session) {
     req(modelos())
     cat("Modelos carregados:\n")
     for(m in modelos()) {
-      cat(m, "\n")
+      cat(deparse(m), "\n")
     }
   })
   
-  # Atualizar a saída da tabela com mais informações
+  dados_processados <- eventReactive(input$processar, {
+    req(input$arquivo, modelos())
+    
+    # Leitura dos dados
+    dados_parcela <- tryCatch({
+      read.xlsx(input$arquivo$datapath)
+    }, error = function(e) {
+      stop("Erro ao ler o arquivo Excel. Verifique o formato do arquivo.")
+    })
+    
+    # Verificar número de colunas
+    if(ncol(dados_parcela) != 4) {
+      stop("O arquivo deve ter exatamente 4 colunas: parcela, dap, ht e ht_estimada")
+    }
+    
+    # Renomear as colunas
+    names(dados_parcela) <- c("parcela", "dap", "ht", "ht_estimada")
+    
+    # Verificar tipos de dados
+    if(!is.numeric(dados_parcela$dap) || !is.numeric(dados_parcela$ht)) {
+      stop("As colunas DAP e HT devem conter valores numéricos")
+    }
+    
+    parcelas <- unique(dados_parcela$parcela)
+    
+    # Inicialização dos vetores
+    syx <- c()
+    ajuste <- c()
+    result <- c()
+    
+    # Adicionar coluna para armazenar qual modelo foi selecionado
+    modelo_selecionado <- c()
+    
+    withProgress(message = 'Processando dados', value = 0, {
+      for(i in 1:NROW(parcelas)){
+        # Atualizar barra de progresso
+        incProgress(1/NROW(parcelas))
+        
+        # Separar dados com e sem altura
+        dados_ajuste <- subset(dados_parcela, parcela == parcelas[i] & ht_estimada != 0)
+        dados_sem_zero <- subset(dados_parcela, parcela == parcelas[i] & ht_estimada == 0)
+        
+        # Criar ambiente com as variáveis necessárias
+        dados_ajuste_env <- with(dados_ajuste, data.frame(
+          ht = ht,
+          dap = dap
+        ))
+        
+        dados_sem_zero_env <- with(dados_sem_zero, data.frame(
+          dap = dap
+        ))
+        
+        # Testar todos os modelos
+        syx <- numeric(length(modelos()))
+        for(j in 1:length(modelos())){
+          tryCatch({
+            ajuste <- lm(modelos()[[j]], data = dados_ajuste_env)
+            syx[j] <- summary(ajuste)[[6]]
+          }, error = function(e) {
+            syx[j] <- Inf
+            warning(paste("Erro no ajuste do modelo", j, ":", e$message))
+          })
+        }
+        
+        # Selecionar e aplicar o melhor modelo
+        melhor_indice <- which.min(syx)
+        modelo_melhor <- lm(modelos()[[melhor_indice]], data = dados_ajuste_env)
+        
+        # Predizer alturas
+        if(nrow(dados_sem_zero) > 0) {
+          dados_sem_zero$ht_estimada <- predict(modelo_melhor, newdata = dados_sem_zero_env)
+        }
+        
+        # Adicionar informação do modelo selecionado
+        dados_ajuste$modelo_selecionado <- deparse(modelos()[[melhor_indice]])
+        dados_sem_zero$modelo_selecionado <- deparse(modelos()[[melhor_indice]])
+        
+        # Combinar resultados
+        result <- rbind(result, rbind(dados_ajuste, dados_sem_zero))
+      }
+    })
+    
+    return(result)
+  })
+  
   output$tabela_resultados <- renderDT({
     req(dados_processados())
     datatable(dados_processados(),
              options = list(
                pageLength = 10,
-               scrollX = TRUE,
-               dom = 'Bfrtip',
-               buttons = c('copy', 'csv', 'excel')
+               scrollX = TRUE
              ),
              caption = "Resultados do Ajuste de Altura") %>%
-      formatRound(columns = c("dap", "ht"), digits = 2)
+      formatRound(columns = c(2,3,4), digits = 2)
   })
   
-  # Estatísticas do ajuste
+  # Adicionar output para estatísticas do ajuste
   output$estatisticas_ajuste <- renderPrint({
     req(dados_processados())
     dados <- dados_processados()
@@ -251,24 +292,19 @@ server <- function(input, output, session) {
     cat("Resumo do Ajuste:\n")
     cat("Número total de árvores:", nrow(dados), "\n")
     cat("Número de parcelas:", length(unique(dados$parcela)), "\n")
-    
-    # Adicionar informação por parcela
-    cat("\nNúmero de árvores por parcela:\n")
-    print(table(dados$parcela))
+    cat("\nModelos selecionados por parcela:\n")
+    table(dados$modelo_selecionado)
   })
   
-  # Diagnóstico do processamento
-  output$diagnostico <- renderPrint({
-    req(dados_processados())
-    dados <- dados_processados()
-    
-    cat("Diagnóstico do Processamento:\n")
-    cat("\nParcelas processadas:\n")
-    print(table(dados$parcela))
-    
-    cat("\nResumo das alturas por parcela:\n")
-    print(tapply(dados$ht, dados$parcela, summary))
-  })
+  output$download_resultados <- downloadHandler(
+    filename = function() {
+      paste("Resultados_Ajuste_Altura_", format(Sys.time(), "%Y%m%d_%H%M"), ".xlsx", sep="")
+    },
+    content = function(file) {
+      req(dados_processados())
+      write.xlsx(dados_processados(), file)
+    }
+  )
 }
 
 # Executa o aplicativo
